@@ -15,11 +15,12 @@
  */
 
 
-#define _DEFAULT_SOURCE		/* for vsyslog */
+#define _GNU_SOURCE		/* for vsyslog & sighandler_t */
 
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -389,7 +390,7 @@ static void fbr_parse_opts(const char *const *const argv)
 
 /*******************************************************************************
  * 
- * 
+ * Start, stop & main loop
  * 
  ******************************************************************************/
 
@@ -421,6 +422,7 @@ static int fbr_listen_init(const union fbr_sockaddr *const addr)
 	return fd;
 }
 
+#if 0
 static void fbr_listen_fini(const int fd)
 {
 	if (close(fd) < 0)
@@ -428,6 +430,7 @@ static void fbr_listen_fini(const int fd)
 	
 	FBR_DEBUG("listening socket closed\n");
 }
+#endif
 
 static struct mnl_socket *fbr_mnl_init(void)
 {
@@ -517,6 +520,12 @@ static void fbr_add_addr(struct mnl_socket *const mnl,
 	FBR_INFO("added %s to ipset %s\n", infobuf, set_name);
 }
 
+static void fbr_sigterm_init(const sighandler_t hndlr)
+{
+	if (signal(SIGTERM, hndlr) == SIG_ERR)
+		FBR_FATAL("signal: %m\n");
+}
+
 int main(int argc __attribute__((unused)), const char *const *const argv)
 {
 	union fbr_sockaddr client;
@@ -526,18 +535,33 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 	ssize_t insize;
 	int listenfd;
 	
+	volatile sig_atomic_t got_sigterm;
+	volatile int hndlr_fd;
+	
+	void sigterm_hndlr(const int signum) {
+		if (signum == SIGTERM) {
+			close(hndlr_fd);
+			got_sigterm = 1;
+		}
+	}
+	
 	fbr_parse_opts(argv);
 	listenfd = fbr_listen_init(&fbr_listen);
 	mnl = fbr_mnl_init();
 	
-	while (1) {
+	got_sigterm = 0;
+	hndlr_fd = listenfd;
+	fbr_sigterm_init(sigterm_hndlr);
+	
+	while (!got_sigterm) {
 		
 		clientsz = sizeof client;
 		insize = recvfrom(listenfd, &inbuf, sizeof inbuf, 0, &client.sa,
 				  &clientsz);
 		if (insize < 0) {
-			FBR_ERR("recvfrom: %m\n");
-			break;
+			if (got_sigterm)
+				break;
+			FBR_FATAL("recvfrom: %m\n");
 		}
 		
 		if (fbr_verbose) {
@@ -565,5 +589,5 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 	}
 	
 	fbr_mnl_fini(mnl);
-	fbr_listen_fini(listenfd);
+	return EXIT_SUCCESS;
 }
