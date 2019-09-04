@@ -520,9 +520,22 @@ static void fbr_add_addr(struct mnl_socket *const mnl,
 	FBR_INFO("added %s to ipset %s\n", infobuf, set_name);
 }
 
-static void fbr_sigterm_init(const sighandler_t hndlr)
+static volatile sig_atomic_t fbr_got_signal = 0;
+static volatile int fbr_signhdlr_fd;
+
+static void fbr_signal_hndlr(const int signum __attribute__((unused)))
 {
-	if (signal(SIGTERM, hndlr) == SIG_ERR)
+	close(fbr_signhdlr_fd);
+	fbr_got_signal = 1;
+}
+
+static void fbr_sighndlr_init(const int fd)
+{
+	fbr_signhdlr_fd = fd;
+
+	if (signal(SIGTERM, fbr_signal_hndlr) == SIG_ERR)
+		FBR_FATAL("signal: %m\n");
+	if (signal(SIGINT, fbr_signal_hndlr) == SIG_ERR)
 		FBR_FATAL("signal: %m\n");
 }
 
@@ -535,31 +548,18 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 	ssize_t insize;
 	int listenfd;
 	
-	volatile sig_atomic_t got_sigterm;
-	volatile int hndlr_fd;
-	
-	void sigterm_hndlr(const int signum) {
-		if (signum == SIGTERM) {
-			close(hndlr_fd);
-			got_sigterm = 1;
-		}
-	}
-	
 	fbr_parse_opts(argv);
 	listenfd = fbr_listen_init(&fbr_listen);
 	mnl = fbr_mnl_init();
+	fbr_sighndlr_init(listenfd);
 	
-	got_sigterm = 0;
-	hndlr_fd = listenfd;
-	fbr_sigterm_init(sigterm_hndlr);
-	
-	while (!got_sigterm) {
+	while (!fbr_got_signal) {
 		
 		clientsz = sizeof client;
 		insize = recvfrom(listenfd, &inbuf, sizeof inbuf, 0, &client.sa,
 				  &clientsz);
 		if (insize < 0) {
-			if (got_sigterm)
+			if (fbr_got_signal)
 				break;
 			FBR_FATAL("recvfrom: %m\n");
 		}
