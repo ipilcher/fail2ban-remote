@@ -42,6 +42,8 @@
  * 
  ******************************************************************************/
 
+#define FBR_STATIC_ASSERT(x)    _Static_assert((x), "static assertion failed")
+
 struct fbr_addr {
 	sa_family_t		family;
 	union {
@@ -51,11 +53,11 @@ struct fbr_addr {
 };
 
 /* Verify fbr_addr wire format */
-_Static_assert(sizeof(sa_family_t) == 2);
-_Static_assert(sizeof(struct in_addr) == 4);
-_Static_assert(sizeof(struct in6_addr) == 16);
-_Static_assert(offsetof(struct fbr_addr, in) == 4);
-_Static_assert(offsetof(struct fbr_addr, in6) == 4);
+FBR_STATIC_ASSERT(sizeof(sa_family_t) == 2);
+FBR_STATIC_ASSERT(sizeof(struct in_addr) == 4);
+FBR_STATIC_ASSERT(sizeof(struct in6_addr) == 16);
+FBR_STATIC_ASSERT(offsetof(struct fbr_addr, in) == 4);
+FBR_STATIC_ASSERT(offsetof(struct fbr_addr, in6) == 4);
 
 union fbr_sockaddr {
 	struct sockaddr		sa;
@@ -64,7 +66,7 @@ union fbr_sockaddr {
 };
 
 /* Verify that port members overlap as expected */
-_Static_assert(offsetof(union fbr_sockaddr, sin.sin_port)
+FBR_STATIC_ASSERT(offsetof(union fbr_sockaddr, sin.sin_port)
 			== offsetof(union fbr_sockaddr, sin6.sin6_port));
 
 
