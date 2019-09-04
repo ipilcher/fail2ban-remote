@@ -3,6 +3,7 @@ policy_module(fail2ban_remote, 0.0.2)
 require {
 	type devlog_t;
 	type kernel_t;
+	type node_t;
 	type user_devpts_t;
 };
 
@@ -23,3 +24,13 @@ bool fbr_remote_log_stderr false;
 if (fbr_remote_log_stderr) {
 	allow fbr_remote_t user_devpts_t:chr_file { read append write };
 }
+
+# listening socket
+allow fbr_remote_t self:udp_socket { create bind read };
+allow fbr_remote_t fbr_port_t:udp_socket name_bind;
+allow fbr_remote_t node_t:udp_socket node_bind;
+allow fbr_remote_t self:capability net_bind_service;
+
+# netlink socket
+allow fbr_remote_t self:netlink_socket { create bind getattr write read };
+allow fbr_remote_t self:capability net_admin;
