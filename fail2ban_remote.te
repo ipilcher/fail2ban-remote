@@ -1,0 +1,18 @@
+policy_module(fail2ban_remote, 0.0.2)
+
+require {
+	type devlog_t;
+	type kernel_t;
+};
+
+type fbr_remote_t;
+type fbr_remote_exec_t;
+type fbr_port_t;
+
+init_daemon_domain(fbr_remote_t, fbr_remote_exec_t)
+corenet_port(fbr_port_t)
+
+# syslog
+allow fbr_remote_t self:unix_dgram_socket { create connect write };
+allow fbr_remote_t devlog_t:sock_file write;
+allow fbr_remote_t kernel_t:unix_dgram_socket sendto;
