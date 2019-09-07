@@ -1,4 +1,4 @@
-policy_module(fail2ban_remote, 0.0.2)
+policy_module(fail2ban_remote, 0.0.3)
 
 require {
 	type devlog_t;
@@ -32,5 +32,5 @@ allow fbr_remote_t node_t:udp_socket node_bind;
 allow fbr_remote_t self:capability net_bind_service;
 
 # netlink socket
-allow fbr_remote_t self:netlink_socket { create bind getattr write read };
+allow fbr_remote_t self:netlink_netfilter_socket { create bind getattr write read };
 allow fbr_remote_t self:capability net_admin;
