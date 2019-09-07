@@ -1,0 +1,12 @@
+[Unit]
+Description=Remote IP set agent for Fail2Ban
+After=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+ExecStart=/usr/local/bin/fbr-remote -v -l 192.168.122.52 -4 FBR_IPV4 -6 FBR_IPV6
+
+[Install]
+WantedBy=multi-user.target
