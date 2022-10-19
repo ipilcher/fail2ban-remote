@@ -1,13 +1,13 @@
 [Unit]
-Description=Remote IP set agent for Fail2Ban
+Description=Remote nftables agent for Fail2Ban
+Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nobody
+DynamicUser=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-ExecStart=/usr/local/bin/fbr-remote -v -l 192.168.122.52 -4 FBR_IPV4 -6 FBR_IPV6
+ExecStart=/usr/local/bin/fbr-remote -v -a 172.31.255.254 -p inet -t filter -s FAIL2BAN4 -P inet -T filter -S FAIL2BAN6
 
 [Install]
 WantedBy=multi-user.target
