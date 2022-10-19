@@ -108,6 +108,12 @@ static uint16_t fbr_parse_port(const char *const arg)
 
 int main(const int argc, const char *const *const argv)
 {
+	const struct sockaddr_in sport = {
+		.sin_family	= AF_INET,
+		.sin_port	= htons(789),
+		.sin_addr	= { .s_addr = INADDR_ANY }
+	};
+
 	union fbr_sockaddr remote;
 	struct fbr_addr ip;
 	ssize_t sent;
@@ -124,6 +130,11 @@ int main(const int argc, const char *const *const argv)
 	
 	if ((sockfd = socket(remote.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
 		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	if (bind(sockfd, (const void *)&sport, sizeof sport) != 0) {
+		perror("bind");
 		exit(EXIT_FAILURE);
 	}
 	
