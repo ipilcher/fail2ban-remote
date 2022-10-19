@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Ian Pilcher <arequipeno@gmail.com>
+ * Copyright 2019, 2022 Ian Pilcher <arequipeno@gmail.com>
  *
  * This program is free software.  You can redistribute it or modify it under
  * the terms of version 2 of the GNU General Public License (GPL), as published
@@ -13,9 +13,6 @@
  *
  *   http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
  */
-
-
-#define _GNU_SOURCE		/* for vsyslog & sighandler_t */
 
 #include <assert.h>
 #include <errno.h>
@@ -32,7 +29,9 @@
 #include <time.h>
 
 #include <linux/netfilter/ipset/ip_set.h>
+#include <linux/netfilter/nf_tables.h>
 #include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter.h>
 
 #include <libmnl/libmnl.h>
 
@@ -192,16 +191,22 @@ static const char *fbr_format_sa(const union fbr_sockaddr *const sa,
 
 static _Bool fbr_stderr_opt = 0;
 static _Bool fbr_verbose = 0;
-static const char *fbr_set4_name;
-static const char *fbr_set6_name;
+static const char *fbr_set4;
+static const char *fbr_set6;
+static uint16_t fbr_proto4;
+static uint16_t fbr_proto6;
+static const char *fbr_table4;
+static const char *fbr_table6;
 static union fbr_sockaddr fbr_listen = { .sin6 = { .sin6_port = HTONS(789) } };
 
 __attribute__((noreturn))
 static void fbr_help(const char *const exec, const int rc)
 {
-	printf("Usage: %s [-s|--stderr] [-v|--verbose] [-h|--help]\n"
-	       "\t[-p|--port PORT] -l|--listen ADDRESS\n"
-	       "\t-4|--ipv4-ipset IPV4_IPSET -6|--ipv6-ipset IPV6_IPSET\n",
+	printf("Usage: %s [-e|--stderr] [-v|--verbose] [-h|--help]\n"
+			"\t[-l|--listen-port PORT] -a|--listen-addr ADDRESS\n"
+			"\t-p|--ipv4-proto PROTOCOL -P|--ipv6-proto PROTOCOL\n"
+			"\t-t|--ipv4-table TABLE -T|--ipv6-table TABLE\n"
+			"\t-s|--ipv4-set SET -S|--ipv6-set SET\n",
 	       exec);
 	exit(rc);
 }
@@ -227,22 +232,72 @@ static void fbr_parse_verbose(const char *exec __attribute__((unused)),
 
 static void fbr_parse_set4(const char *const exec, const char *const arg)
 {
-	if (*arg == '\0' || strlen(arg) >= IPSET_MAXNAMELEN) {
-		FBR_ERR("invalid IPv4 ipset name: %s\n", arg);
+	if (*arg == '\0' || strlen(arg) >= NFT_SET_MAXNAMELEN) {
+		FBR_ERR("invalid IPv4 set name: %s\n", arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
 	
-	fbr_set4_name = arg;
+	fbr_set4 = arg;
 }
 
 static void fbr_parse_set6(const char *const exec, const char *const arg)
 {
-	if (*arg == '\0' || strlen(arg) >= IPSET_MAXNAMELEN) {
-		FBR_ERR("invalid IPv6 ipset name: %s\n", arg);
+	if (*arg == '\0' || strlen(arg) >= NFT_SET_MAXNAMELEN) {
+		FBR_ERR("invalid IPv6 set name: %s\n", arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
 	
-	fbr_set6_name = arg;
+	fbr_set6 = arg;
+}
+
+static void fbr_parse_table4(const char *const exec, const char *const arg)
+{
+	if (*arg == '\0' || strlen(arg) >= NFT_TABLE_MAXNAMELEN) {
+		FBR_ERR("invalid IPv4 table name: %s\n", arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
+
+	fbr_table4 = arg;
+}
+
+static void fbr_parse_table6(const char *const exec, const char *const arg)
+{
+	if (*arg == '\0' || strlen(arg) >= NFT_TABLE_MAXNAMELEN) {
+		FBR_ERR("invalid IPv6 table name: %s\n", arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
+
+	fbr_table6 = arg;
+}
+
+static void fbr_parse_proto4(const char *const exec, const char *const arg)
+{
+	if (strcmp(arg, "inet") == 0) {
+		fbr_proto4 = NFPROTO_INET;
+	}
+	else if (strcmp(arg, "ip") == 0) {
+		fbr_proto4 = NFPROTO_IPV4;
+	}
+	else {
+		FBR_ERR("invalid IPv4 protocol (not 'inet' or 'ip'): %s\n",
+			arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
+}
+
+static void fbr_parse_proto6(const char *const exec, const char *const arg)
+{
+	if (strcmp(arg, "inet") == 0) {
+		fbr_proto6 = NFPROTO_INET;
+	}
+	else if (strcmp(arg, "ip6") == 0) {
+		fbr_proto6 = NFPROTO_IPV6;
+	}
+	else {
+		FBR_ERR("invalid IPv6 protocol (not 'inet' or 'ip6'): %s\n",
+			arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
 }
 
 static void fbr_parse_port(const char *const exec, const char *const arg)
@@ -253,7 +308,7 @@ static void fbr_parse_port(const char *const exec, const char *const arg)
 	errno = 0;
 	port = strtoul(arg, &endptr, 0);
 	if (errno != 0 || *endptr != '\0' || port > UINT16_MAX) {
-		FBR_ERR("invalid UDP port number: %s\n", arg);
+		FBR_ERR("invalid listen port: %s\n", arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
 		
@@ -272,7 +327,7 @@ static void fbr_parse_addr(const char *const exec, const char *const arg)
 		return;
 	}
 	
-	FBR_ERR("invalid IP address: %s\n", arg);
+	FBR_ERR("invalid listen address: %s\n", arg);
 	fbr_help(exec, EXIT_FAILURE);
 }
 	
@@ -286,14 +341,18 @@ struct fbr_option {
 };
 
 static struct fbr_option fbr_options[] = {
-	{ "-s", "--stderr",	fbr_parse_stderr,	0, 0, 0 },
-	{ "-v", "--verbose",	fbr_parse_verbose,	0, 0, 0 },
-	{ "-p", "--port",	fbr_parse_port,		1, 0, 0 },
-	{ "-l", "--listen",	fbr_parse_addr,		1, 0, 1 },
-	{ "-h", "--help",	fbr_parse_help,		0, 0, 0 },
-	{ "-4", "--ipv4-ipset", fbr_parse_set4,		1, 0, 1 },
-	{ "-6", "--ipv6-ipset", fbr_parse_set6,		1, 0, 1 },
-	{ NULL, NULL,		0,			0, 0, 0 }
+	{ "-e", "--stderr",		fbr_parse_stderr,	0, 0, 0 },
+	{ "-v", "--verbose",		fbr_parse_verbose,	0, 0, 0 },
+	{ "-h", "--help",		fbr_parse_help,		0, 0, 0 },
+	{ "-l", "--listen-port",	fbr_parse_port,		1, 0, 0 },
+	{ "-a", "--listen-addr",	fbr_parse_addr,		1, 0, 1 },
+	{ "-p", "--ipv4-proto",		fbr_parse_proto4,	1, 0, 1 },
+	{ "-P", "--ipv6-proto",		fbr_parse_proto6,	1, 0, 1 },
+	{ "-t", "--ipv4-table",		fbr_parse_table4,	1, 0, 1 },
+	{ "-T", "--ipv6-table",		fbr_parse_table6,	1, 0, 1 },
+	{ "-s", "--ipv4-set",		fbr_parse_set4,		1, 0, 1 },
+	{ "-S", "--ipv6-set",		fbr_parse_set6,		1, 0, 1 },
+	{ NULL, NULL,			0,			0, 0, 0 }
 };
 
 static _Bool fbr_arg_is_opt(const char *const arg,
@@ -330,13 +389,19 @@ static void fbr_dump_opts(void)
 	FBR_DEBUG("  log to stderr: %s\n",
 		  fbr_log_stderr ? "true" : "false");
 	FBR_DEBUG("  verbose: %s\n", fbr_verbose ? "true" : "false");
-	FBR_DEBUG("  IP version: IPv%d\n",
-		  fbr_listen.sa.sa_family == AF_INET ? 4 : 6);
 	FBR_DEBUG("  listen address: %s\n", fbr_format_sa(&fbr_listen, buf));
 	FBR_DEBUG("  listen port: %" PRIu16 "\n",
 		  ntohs(fbr_listen.sin.sin_port));
-	FBR_DEBUG("  IPv4 ipset name: %s\n", fbr_set4_name);
-	FBR_DEBUG("  IPv6 ipset name: %s\n", fbr_set6_name);
+
+	FBR_DEBUG("  IPv4 protocol: %s\n",
+		  (fbr_proto4 == NFPROTO_INET) ? "inet" : "ip");
+	FBR_DEBUG("  IPv4 table: %s\n", fbr_table4);
+	FBR_DEBUG("  IPv4 set: %s\n", fbr_set4);
+
+	FBR_DEBUG("  IPv6 protocol: %s\n",
+		  (fbr_proto6 == NFPROTO_INET) ? "inet" : "ip6");
+	FBR_DEBUG("  IPv6 table: %s\n", fbr_table6);
+	FBR_DEBUG("  IPv6 set: %s\n", fbr_set6);
 }
 
 static void fbr_parse_opts(const char *const *const argv)
@@ -422,16 +487,6 @@ static int fbr_listen_init(const union fbr_sockaddr *const addr)
 	return fd;
 }
 
-#if 0
-static void fbr_listen_fini(const int fd)
-{
-	if (close(fd) < 0)
-		FBR_FATAL("close: %m\n");
-	
-	FBR_DEBUG("listening socket closed\n");
-}
-#endif
-
 static struct mnl_socket *fbr_mnl_init(void)
 {
 	struct mnl_socket *mnl;
@@ -455,69 +510,127 @@ static void fbr_mnl_fini(struct mnl_socket *const mnl)
 	FBR_DEBUG("netfilter netlink socket closed\n");
 }
 
+static struct nlmsghdr *fbr_msghdr(char *const buf, const uint16_t type,
+				   const uint16_t family, const uint16_t flags,
+				   const uint32_t seq, const uint16_t res_id)
+{
+	struct nlmsghdr *nlh;
+	struct nfgenmsg *nfg;
+
+	nlh = mnl_nlmsg_put_header(buf);
+	nlh->nlmsg_type = type;
+	nlh->nlmsg_flags = NLM_F_REQUEST | flags;
+	nlh->nlmsg_seq = seq;
+
+	nfg = mnl_nlmsg_put_extra_header(nlh, sizeof *nfg);
+	nfg->nfgen_family = family;
+	nfg->version = NFNETLINK_V0;
+	nfg->res_id = htons(res_id);
+
+	return nlh;
+}
+
+static void fbr_nlmsg(struct mnl_nlmsg_batch *const batch,
+		      const struct fbr_addr *const addr, const uint16_t proto,
+		      const char *const table, const char *const set)
+{
+	struct nlmsghdr *nlh;
+	struct nlattr *list, *elem, *key;
+	uint32_t seq;
+
+
+	seq = time(NULL);
+
+	fbr_msghdr(mnl_nlmsg_batch_current(batch), NFNL_MSG_BATCH_BEGIN,
+		   NFPROTO_UNSPEC, 0, seq++, NFNL_SUBSYS_NFTABLES);
+	mnl_nlmsg_batch_next(batch);
+
+	nlh = fbr_msghdr(mnl_nlmsg_batch_current(batch),
+			 (NFNL_SUBSYS_NFTABLES << 8) |NFT_MSG_NEWSETELEM,
+			 proto, NLM_F_CREATE | NLM_F_ACK, seq++, 0);
+
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, table);
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set);
+
+	list = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_LIST_ELEMENTS);
+	elem = mnl_attr_nest_start(nlh, 1);  /* element index in list */
+	key = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_KEY);
+
+	if (addr->family == AF_INET) {
+		mnl_attr_put_u32(nlh, NFTA_DATA_VALUE, addr->in.s_addr);
+	}
+	else {
+		mnl_attr_put(nlh, NFTA_DATA_VALUE, sizeof addr->in6,
+			     &addr->in6);
+	}
+
+	mnl_attr_nest_end(nlh, key);
+	mnl_attr_nest_end(nlh, elem);
+	mnl_attr_nest_end(nlh, list);
+	mnl_nlmsg_batch_next(batch);
+
+	fbr_msghdr(mnl_nlmsg_batch_current(batch), NFNL_MSG_BATCH_END,
+		   NFPROTO_UNSPEC, 0, seq++, NFNL_SUBSYS_NFTABLES);
+	mnl_nlmsg_batch_next(batch);
+}
+
+static const char *fbr_fmt_proto(const uint16_t proto)
+{
+	switch (proto) {
+		case NFPROTO_INET:	return "inet";
+		case NFPROTO_IPV4:	return "ip";
+		case NFPROTO_IPV6:	return "ip6";
+	}
+
+	abort();
+}
+
 static void fbr_add_addr(struct mnl_socket *const mnl,
 			 const struct fbr_addr *const addr)
 {
-	uint8_t msgbuf[MNL_SOCKET_BUFFER_SIZE];
-	struct nlattr *attr_data, *attr_addr;
-	char infobuf[INET6_ADDRSTRLEN];
-	const char *set_name;
-	struct nlmsghdr *nlh;
-	struct nfgenmsg *nfg;
+	char buf[MNL_SOCKET_BUFFER_SIZE * 2];
+	char addrbuf[INET6_ADDRSTRLEN];
+	struct mnl_nlmsg_batch *batch;
 	ssize_t ret;
-	time_t seq;
-	
-	set_name = (addr->family == AF_INET) ? fbr_set4_name : fbr_set6_name;
-	
-	nlh = mnl_nlmsg_put_header(msgbuf);
-	nlh->nlmsg_type = IPSET_CMD_ADD | (NFNL_SUBSYS_IPSET << 8);
-	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-	nlh->nlmsg_seq = time(&seq);
-	
-	nfg = mnl_nlmsg_put_extra_header(nlh, sizeof *nfg);
-	nfg->nfgen_family = addr->family;
-	nfg->version = NFNETLINK_V0;
-	nfg->res_id = 0;
-	
-	mnl_attr_put_u8(nlh, IPSET_ATTR_PROTOCOL, IPSET_PROTOCOL);
-	mnl_attr_put(nlh, IPSET_ATTR_SETNAME, strlen(set_name) + 1, set_name);
-	
-	attr_data = mnl_attr_nest_start(nlh, IPSET_ATTR_DATA);
-	attr_addr = mnl_attr_nest_start(nlh, IPSET_ATTR_IP);
-	
+	const char *table, *set;
+	uint16_t proto;
+
 	if (addr->family == AF_INET) {
-		mnl_attr_put(nlh, IPSET_ATTR_IPADDR_IPV4 | NLA_F_NET_BYTEORDER,
-			     sizeof addr->in, &addr->in);
-		fbr_inet_ntop(AF_INET, &addr->in, infobuf);
+		fbr_inet_ntop(AF_INET, &addr->in, addrbuf);
+		proto = fbr_proto4;
+		table = fbr_table4;
+		set = fbr_set4;
 	}
 	else {
-		mnl_attr_put(nlh, IPSET_ATTR_IPADDR_IPV6 | NLA_F_NET_BYTEORDER,
-			     sizeof addr->in6, &addr->in6);
-		fbr_inet_ntop(AF_INET6, &addr->in6, infobuf);
+		fbr_inet_ntop(AF_INET6, &addr->in6, addrbuf);
+		proto = fbr_proto6;
+		table = fbr_table6;
+		set = fbr_set6;
 	}
-	
-	mnl_attr_nest_end(nlh, attr_addr);
-	mnl_attr_nest_end(nlh, attr_data);
-	
-	if (mnl_socket_sendto(mnl, nlh, nlh->nlmsg_len) < 0) {
-		FBR_ERR("mnl_socket_sendto: %m\n");
-		exit(EXIT_FAILURE);
-	}
-	
-	if ((ret = mnl_socket_recvfrom(mnl, msgbuf, sizeof msgbuf)) < 0) {
-		FBR_ERR("mnl_socket_recvfrom: %m\n");
-		exit(EXIT_FAILURE);
-	}
-	
+
+	batch = mnl_nlmsg_batch_start(buf, sizeof buf);
+
+	fbr_nlmsg(batch, addr, proto, table, set);
+
+	ret = mnl_socket_sendto(mnl, mnl_nlmsg_batch_head(batch),
+				mnl_nlmsg_batch_size(batch));
+	if (ret < 0)
+		FBR_FATAL("mnl_socket_sendto: %m\n");
+
+	mnl_nlmsg_batch_stop(batch);
+
+	if ((ret = mnl_socket_recvfrom(mnl, buf, sizeof buf)) < 0)
+		FBR_FATAL("mnl_socket_recvfrom: %m\n");
+
 	do {
-		if ((ret = mnl_cb_run(msgbuf, ret, seq, 0, 0, 0)) < 0) {
-			FBR_ERR("mnl_cb_run: %m\n");
-			exit(EXIT_FAILURE);
-		}
+		if ((ret = mnl_cb_run(buf, ret, 0, 0, 0, 0)) < 0)
+			FBR_FATAL("mnl_cb_run: %m\n");
 	}
 	while (ret > 0);
-	
-	FBR_INFO("added %s to ipset %s\n", infobuf, set_name);
+
+	FBR_INFO("added %s to %s:%s:%s\n", addrbuf,
+		 fbr_fmt_proto(proto), table, set);
+
 }
 
 static volatile sig_atomic_t fbr_got_signal = 0;
@@ -571,7 +684,7 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 				  ntohs(client.sin.sin_port));
 		}
 		
-		if (insize < sizeof inbuf) {
+		if ((size_t)insize < sizeof inbuf) {
 			FBR_WARN("received %zd bytes; expected %zd\n", insize,
 				 sizeof inbuf);
 			continue;
