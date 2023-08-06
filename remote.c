@@ -1,5 +1,5 @@
 /*
- * Copyright 2019, 2022 Ian Pilcher <arequipeno@gmail.com>
+ * Copyright 2019, 2022, 2023 Ian Pilcher <arequipeno@gmail.com>
  *
  * This program is free software.  You can redistribute it or modify it under
  * the terms of version 2 of the GNU General Public License (GPL), as published
@@ -14,7 +14,9 @@
  *   http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
  */
 
+#include <arpa/inet.h>
 #include <assert.h>
+#include <endian.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -23,10 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <arpa/inet.h>
 #include <syslog.h>
-#include <time.h>
 
 #include <linux/netfilter/ipset/ip_set.h>
 #include <linux/netfilter/nf_tables.h>
@@ -34,6 +33,8 @@
 #include <linux/netfilter.h>
 
 #include <libmnl/libmnl.h>
+
+#define FBR_MAX_TIMEOUT		31557600  /* 365.25 days */
 
 
 /*******************************************************************************
@@ -171,33 +172,32 @@ static const char *fbr_format_sa(const union fbr_sockaddr *const sa,
  */
 
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-
 	#define HTONS(x)	((uint16_t)x)
-	
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-
 	#define HTONS(x)	(((((uint16_t)x) & 0x00ff) << 8) 	       \
 					| ((((uint16_t)x) & 0xff00) >> 8))
-	
 #else
-	
 	#error "unknown __BYTE_ORDER__"
-	
 #endif
 
 /*
  * The options, some with default values
  */
 
-static _Bool fbr_stderr_opt = 0;
-static _Bool fbr_verbose = 0;
-static const char *fbr_set4;
-static const char *fbr_set6;
-static uint16_t fbr_proto4;
-static uint16_t fbr_proto6;
-static const char *fbr_table4;
-static const char *fbr_table6;
-static union fbr_sockaddr fbr_listen = { .sin6 = { .sin6_port = HTONS(789) } };
+struct fbr_set_opts {
+	const char 	*table;
+	const char 	*set;
+	unsigned int	timeout;
+	uint16_t	proto;
+};
+
+static struct fbr_set_opts fbr_set_opts4 = { .timeout = 3600 };
+static struct fbr_set_opts fbr_set_opts6 = { .timeout = 3600 };
+static _Bool fbr_stderr_opt;
+static _Bool fbr_verbose;
+static union fbr_sockaddr fbr_listen = {
+	.sin6 = { .sin6_port = HTONS(789) }
+};
 
 __attribute__((noreturn))
 static void fbr_help(const char *const exec, const int rc)
@@ -206,7 +206,9 @@ static void fbr_help(const char *const exec, const int rc)
 			"\t[-l|--listen-port PORT] -a|--listen-addr ADDRESS\n"
 			"\t-p|--ipv4-proto PROTOCOL -P|--ipv6-proto PROTOCOL\n"
 			"\t-t|--ipv4-table TABLE -T|--ipv6-table TABLE\n"
-			"\t-s|--ipv4-set SET -S|--ipv6-set SET\n",
+			"\t-s|--ipv4-set SET -S|--ipv6-set SET\n"
+			"\t[-o|--ipv4-timeout SECONDS] "
+				"[-O|--ipv6_timeout SECONDS]\n",
 	       exec);
 	exit(rc);
 }
@@ -237,7 +239,7 @@ static void fbr_parse_set4(const char *const exec, const char *const arg)
 		fbr_help(exec, EXIT_FAILURE);
 	}
 	
-	fbr_set4 = arg;
+	fbr_set_opts4.set = arg;
 }
 
 static void fbr_parse_set6(const char *const exec, const char *const arg)
@@ -247,7 +249,7 @@ static void fbr_parse_set6(const char *const exec, const char *const arg)
 		fbr_help(exec, EXIT_FAILURE);
 	}
 	
-	fbr_set6 = arg;
+	fbr_set_opts6.set = arg;
 }
 
 static void fbr_parse_table4(const char *const exec, const char *const arg)
@@ -257,7 +259,7 @@ static void fbr_parse_table4(const char *const exec, const char *const arg)
 		fbr_help(exec, EXIT_FAILURE);
 	}
 
-	fbr_table4 = arg;
+	fbr_set_opts4.table = arg;
 }
 
 static void fbr_parse_table6(const char *const exec, const char *const arg)
@@ -267,19 +269,23 @@ static void fbr_parse_table6(const char *const exec, const char *const arg)
 		fbr_help(exec, EXIT_FAILURE);
 	}
 
-	fbr_table6 = arg;
+	fbr_set_opts6.table = arg;
 }
 
 static void fbr_parse_proto4(const char *const exec, const char *const arg)
 {
 	if (strcmp(arg, "inet") == 0) {
-		fbr_proto4 = NFPROTO_INET;
+		fbr_set_opts4.proto = NFPROTO_INET;
 	}
 	else if (strcmp(arg, "ip") == 0) {
-		fbr_proto4 = NFPROTO_IPV4;
+		fbr_set_opts4.proto = NFPROTO_IPV4;
+	}
+	else if (strcmp(arg, "netdev") == 0) {
+		fbr_set_opts4.proto = NFPROTO_NETDEV;
 	}
 	else {
-		FBR_ERR("invalid IPv4 protocol (not 'inet' or 'ip'): %s\n",
+		FBR_ERR("invalid IPv4 protocol "
+				"(not 'inet', 'ip', or 'netdev'): %s\n",
 			arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
@@ -288,13 +294,17 @@ static void fbr_parse_proto4(const char *const exec, const char *const arg)
 static void fbr_parse_proto6(const char *const exec, const char *const arg)
 {
 	if (strcmp(arg, "inet") == 0) {
-		fbr_proto6 = NFPROTO_INET;
+		fbr_set_opts6.proto = NFPROTO_INET;
 	}
 	else if (strcmp(arg, "ip6") == 0) {
-		fbr_proto6 = NFPROTO_IPV6;
+		fbr_set_opts6.proto = NFPROTO_IPV6;
+	}
+	else if (strcmp(arg, "netdev") == 0) {
+		fbr_set_opts6.proto = NFPROTO_NETDEV;
 	}
 	else {
-		FBR_ERR("invalid IPv6 protocol (not 'inet' or 'ip6'): %s\n",
+		FBR_ERR("invalid IPv6 protocol "
+				"(not 'inet', 'ip6', or 'netdev'): %s\n",
 			arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
@@ -306,13 +316,39 @@ static void fbr_parse_port(const char *const exec, const char *const arg)
 	char *endptr;
 	
 	errno = 0;
-	port = strtoul(arg, &endptr, 0);
-	if (errno != 0 || *endptr != '\0' || port > UINT16_MAX) {
+	port = strtoul(arg, &endptr, 10);
+	if (errno != 0 || *endptr != 0 || port > UINT16_MAX) {
 		FBR_ERR("invalid listen port: %s\n", arg);
 		fbr_help(exec, EXIT_FAILURE);
 	}
 		
-	fbr_listen.sin6.sin6_port = htons(port);
+	fbr_listen.sin6.sin6_port = htobe16(port);
+}
+
+static void fbr_parse_timeout4(const char *const exec, const char *const arg)
+{
+	char *endptr;
+
+	errno = 0;
+	fbr_set_opts4.timeout = strtoul(arg, &endptr, 10);
+	if (errno != 0 || *endptr != 0
+			|| fbr_set_opts4.timeout > FBR_MAX_TIMEOUT) {
+		FBR_ERR("invalid IPv4 timeout: %s\n", arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
+}
+
+static void fbr_parse_timeout6(const char *const exec, const char *const arg)
+{
+	char *endptr;
+
+	errno = 0;
+	fbr_set_opts6.timeout = strtoul(arg, &endptr, 10);
+	if (errno != 0 || *endptr != 0
+			|| fbr_set_opts6.timeout > FBR_MAX_TIMEOUT) {
+		FBR_ERR("invalid IPv6 timeout: %s\n", arg);
+		fbr_help(exec, EXIT_FAILURE);
+	}
 }
 
 static void fbr_parse_addr(const char *const exec, const char *const arg)
@@ -352,6 +388,8 @@ static struct fbr_option fbr_options[] = {
 	{ "-T", "--ipv6-table",		fbr_parse_table6,	1, 0, 1 },
 	{ "-s", "--ipv4-set",		fbr_parse_set4,		1, 0, 1 },
 	{ "-S", "--ipv6-set",		fbr_parse_set6,		1, 0, 1 },
+	{ "-o", "--ipv4-timeout",	fbr_parse_timeout4,	1, 0, 0 },
+	{ "-O", "--ipv6-timeout",	fbr_parse_timeout6,	1, 0, 0 },
 	{ NULL, NULL,			0,			0, 0, 0 }
 };
 
@@ -378,6 +416,18 @@ static void fbr_parse_opt(const char *const exec, const char *const arg,
 	opt->parse(exec, arg);
 }
 
+static const char *fbr_fmt_proto(const uint16_t proto)
+{
+	switch (proto) {
+		case NFPROTO_INET:	return "inet";
+		case NFPROTO_IPV4:	return "ip";
+		case NFPROTO_IPV6:	return "ip6";
+		case NFPROTO_NETDEV:	return "netdev";
+	}
+
+	abort();
+}
+
 static void fbr_dump_opts(void)
 {
 	char buf[INET6_ADDRSTRLEN];
@@ -391,17 +441,17 @@ static void fbr_dump_opts(void)
 	FBR_DEBUG("  verbose: %s\n", fbr_verbose ? "true" : "false");
 	FBR_DEBUG("  listen address: %s\n", fbr_format_sa(&fbr_listen, buf));
 	FBR_DEBUG("  listen port: %" PRIu16 "\n",
-		  ntohs(fbr_listen.sin.sin_port));
+		  be16toh(fbr_listen.sin.sin_port));
 
-	FBR_DEBUG("  IPv4 protocol: %s\n",
-		  (fbr_proto4 == NFPROTO_INET) ? "inet" : "ip");
-	FBR_DEBUG("  IPv4 table: %s\n", fbr_table4);
-	FBR_DEBUG("  IPv4 set: %s\n", fbr_set4);
+	FBR_DEBUG("  IPv4 protocol: %s\n", fbr_fmt_proto(fbr_set_opts4.proto));
+	FBR_DEBUG("  IPv4 table: %s\n", fbr_set_opts4.table);
+	FBR_DEBUG("  IPv4 set: %s\n", fbr_set_opts4.set);
+	FBR_DEBUG("  IPv4 timeout: %u\n", fbr_set_opts4.timeout);
 
-	FBR_DEBUG("  IPv6 protocol: %s\n",
-		  (fbr_proto6 == NFPROTO_INET) ? "inet" : "ip6");
-	FBR_DEBUG("  IPv6 table: %s\n", fbr_table6);
-	FBR_DEBUG("  IPv6 set: %s\n", fbr_set6);
+	FBR_DEBUG("  IPv6 protocol: %s\n", fbr_fmt_proto(fbr_set_opts6.proto));
+	FBR_DEBUG("  IPv6 table: %s\n", fbr_set_opts6.table);
+	FBR_DEBUG("  IPv6 set: %s\n", fbr_set_opts6.set);
+	FBR_DEBUG("  IPv6 timeout: %u\n", fbr_set_opts6.timeout);
 }
 
 static void fbr_parse_opts(const char *const *const argv)
@@ -459,6 +509,10 @@ static void fbr_parse_opts(const char *const *const argv)
  * 
  ******************************************************************************/
 
+static struct mnl_socket *fbr_mnl_socket;
+static unsigned int fbr_mnl_portid;
+static uint32_t fbr_mnl_sequence;
+
 static int fbr_listen_init(const union fbr_sockaddr *const addr)
 {
 	socklen_t addrlen;
@@ -481,156 +535,171 @@ static int fbr_listen_init(const union fbr_sockaddr *const addr)
 		char buf[INET6_ADDRSTRLEN];
 		FBR_DEBUG("listening on %s/%" PRIu16 "\n",
 			  fbr_format_sa(addr, buf),
-			  ntohs(addr->sin6.sin6_port));
+			  be16toh(addr->sin6.sin6_port));
 	}		
 	
 	return fd;
 }
 
-static struct mnl_socket *fbr_mnl_init(void)
+static void fbr_mnl_init(void)
 {
-	struct mnl_socket *mnl;
-	
-	if ((mnl = mnl_socket_open(NETLINK_NETFILTER)) == NULL)
+	if ((fbr_mnl_socket = mnl_socket_open(NETLINK_NETFILTER)) == NULL)
 		FBR_FATAL("mnl_socket_open: %m\n");
 	
-	if (mnl_socket_bind(mnl, 0, MNL_SOCKET_AUTOPID) < 0)
+	if (mnl_socket_bind(fbr_mnl_socket, 0, MNL_SOCKET_AUTOPID) < 0)
 		FBR_FATAL("mnl_socket_bind: %m\n");
+
+	fbr_mnl_portid = mnl_socket_get_portid(fbr_mnl_socket);
 	
 	FBR_DEBUG("netfilter netlink socket created and bound\n");
-
-	return mnl;
 }
 
-static void fbr_mnl_fini(struct mnl_socket *const mnl)
+static void fbr_mnl_fini(void)
 {
-	if (mnl_socket_close(mnl) < 0)
+	if (mnl_socket_close(fbr_mnl_socket) < 0)
 		FBR_FATAL("mnl_socket_close: %m\n");
 	
 	FBR_DEBUG("netfilter netlink socket closed\n");
 }
 
-static struct nlmsghdr *fbr_msghdr(char *const buf, const uint16_t type,
-				   const uint16_t family, const uint16_t flags,
-				   const uint32_t seq, const uint16_t res_id)
+static void fbr_elem_msg(struct mnl_nlmsg_batch *const batch,
+			 const uint16_t msg_type,
+			 const struct fbr_addr *const addr,
+			 const struct fbr_set_opts *set_opts,
+			 const _Bool timeout)
+{
+	struct nlmsghdr *nlh;
+	struct nfgenmsg *nfg;
+	struct nlattr *elem_list_attr, *elem_attr, *key_attr;
+
+	nlh = mnl_nlmsg_put_header(mnl_nlmsg_batch_current(batch));
+	nlh->nlmsg_type = NFNL_SUBSYS_NFTABLES << 8 | msg_type;
+	nlh->nlmsg_seq = fbr_mnl_sequence++;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	if (msg_type == NFT_MSG_NEWSETELEM)
+		nlh->nlmsg_flags |= NLM_F_CREATE;
+
+	nfg = mnl_nlmsg_put_extra_header(nlh, sizeof *nfg);
+	nfg->nfgen_family = set_opts->proto;
+	nfg->version=NFNETLINK_V0;
+	nfg->res_id = 0;
+
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, set_opts->table);
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set_opts->set);
+
+	elem_list_attr = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_LIST_ELEMENTS);
+	elem_attr = mnl_attr_nest_start(nlh, 1);  /* nla_type is index # */
+
+	if (timeout) {
+		mnl_attr_put_u64(nlh, NFTA_SET_ELEM_TIMEOUT,
+				 htobe64((uint64_t)set_opts->timeout * 1000));
+	}
+
+	key_attr = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_KEY);
+
+	if (addr->family == AF_INET) {
+		mnl_attr_put(nlh, NFTA_DATA_VALUE, sizeof addr->in, &addr->in);
+	}
+	else {
+		mnl_attr_put(nlh, NFTA_DATA_VALUE,
+			     sizeof addr->in6, &addr->in6);
+	}
+
+	mnl_attr_nest_end(nlh, key_attr);
+	mnl_attr_nest_end(nlh, elem_attr);
+	mnl_attr_nest_end(nlh, elem_list_attr);
+}
+
+static void fbr_batch_msg(struct mnl_nlmsg_batch *const batch,
+			  const uint16_t msg_type)
 {
 	struct nlmsghdr *nlh;
 	struct nfgenmsg *nfg;
 
-	nlh = mnl_nlmsg_put_header(buf);
-	nlh->nlmsg_type = type;
-	nlh->nlmsg_flags = NLM_F_REQUEST | flags;
-	nlh->nlmsg_seq = seq;
+	nlh = mnl_nlmsg_put_header(mnl_nlmsg_batch_current(batch));
+	nlh->nlmsg_type = msg_type;
+	nlh->nlmsg_seq = fbr_mnl_sequence++;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
 
 	nfg = mnl_nlmsg_put_extra_header(nlh, sizeof *nfg);
-	nfg->nfgen_family = family;
-	nfg->version = NFNETLINK_V0;
-	nfg->res_id = htons(res_id);
-
-	return nlh;
+	nfg->nfgen_family = AF_UNSPEC;
+	nfg->version=NFNETLINK_V0;
+	nfg->res_id = htobe16(NFNL_SUBSYS_NFTABLES);
 }
 
-static void fbr_nlmsg(struct mnl_nlmsg_batch *const batch,
-		      const struct fbr_addr *const addr, const uint16_t proto,
-		      const char *const table, const char *const set)
+static void fbr_batch_next(struct mnl_nlmsg_batch *const batch)
 {
-	struct nlmsghdr *nlh;
-	struct nlattr *list, *elem, *key;
-	uint32_t seq;
-
-
-	seq = time(NULL);
-
-	fbr_msghdr(mnl_nlmsg_batch_current(batch), NFNL_MSG_BATCH_BEGIN,
-		   NFPROTO_UNSPEC, 0, seq++, NFNL_SUBSYS_NFTABLES);
-	mnl_nlmsg_batch_next(batch);
-
-	nlh = fbr_msghdr(mnl_nlmsg_batch_current(batch),
-			 (NFNL_SUBSYS_NFTABLES << 8) |NFT_MSG_NEWSETELEM,
-			 proto, NLM_F_CREATE | NLM_F_ACK, seq++, 0);
-
-	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, table);
-	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set);
-
-	list = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_LIST_ELEMENTS);
-	elem = mnl_attr_nest_start(nlh, 1);  /* element index in list */
-	key = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_KEY);
-
-	if (addr->family == AF_INET) {
-		mnl_attr_put_u32(nlh, NFTA_DATA_VALUE, addr->in.s_addr);
-	}
-	else {
-		mnl_attr_put(nlh, NFTA_DATA_VALUE, sizeof addr->in6,
-			     &addr->in6);
-	}
-
-	mnl_attr_nest_end(nlh, key);
-	mnl_attr_nest_end(nlh, elem);
-	mnl_attr_nest_end(nlh, list);
-	mnl_nlmsg_batch_next(batch);
-
-	fbr_msghdr(mnl_nlmsg_batch_current(batch), NFNL_MSG_BATCH_END,
-		   NFPROTO_UNSPEC, 0, seq++, NFNL_SUBSYS_NFTABLES);
-	mnl_nlmsg_batch_next(batch);
+	if (!mnl_nlmsg_batch_next(batch))
+		FBR_FATAL("mnl_nlmsg_batch_next: %m\n");
 }
 
-static const char *fbr_fmt_proto(const uint16_t proto)
+static size_t fbr_build_batch(uint8_t *const buf,
+			      const struct fbr_addr *const addr,
+			      const struct fbr_set_opts *const set_opts)
 {
-	switch (proto) {
-		case NFPROTO_INET:	return "inet";
-		case NFPROTO_IPV4:	return "ip";
-		case NFPROTO_IPV6:	return "ip6";
-	}
-
-	abort();
-}
-
-static void fbr_add_addr(struct mnl_socket *const mnl,
-			 const struct fbr_addr *const addr)
-{
-	char buf[MNL_SOCKET_BUFFER_SIZE * 2];
-	char addrbuf[INET6_ADDRSTRLEN];
 	struct mnl_nlmsg_batch *batch;
-	ssize_t ret;
-	const char *table, *set;
-	uint16_t proto;
+	size_t len;
 
-	if (addr->family == AF_INET) {
-		fbr_inet_ntop(AF_INET, &addr->in, addrbuf);
-		proto = fbr_proto4;
-		table = fbr_table4;
-		set = fbr_set4;
-	}
-	else {
-		fbr_inet_ntop(AF_INET6, &addr->in6, addrbuf);
-		proto = fbr_proto6;
-		table = fbr_table6;
-		set = fbr_set6;
-	}
+	batch = mnl_nlmsg_batch_start(buf, MNL_SOCKET_BUFFER_SIZE);
+	if (batch == NULL)
+		FBR_FATAL("mnl_nlmsg_batch_start: %m\n");
 
-	batch = mnl_nlmsg_batch_start(buf, sizeof buf);
+	fbr_batch_msg(batch, NFNL_MSG_BATCH_BEGIN);
+	fbr_batch_next(batch);
+	fbr_elem_msg(batch, NFT_MSG_NEWSETELEM, addr, set_opts, 0);
+	fbr_batch_next(batch);
+	fbr_elem_msg(batch, NFT_MSG_DELSETELEM, addr, set_opts, 0);
+	fbr_batch_next(batch);
+	fbr_elem_msg(batch, NFT_MSG_NEWSETELEM, addr, set_opts, 1);
+	fbr_batch_next(batch);
+	fbr_batch_msg(batch, NFNL_MSG_BATCH_END);
+	fbr_batch_next(batch);  /* Check that last message fit */
 
-	fbr_nlmsg(batch, addr, proto, table, set);
-
-	ret = mnl_socket_sendto(mnl, mnl_nlmsg_batch_head(batch),
-				mnl_nlmsg_batch_size(batch));
-	if (ret < 0)
-		FBR_FATAL("mnl_socket_sendto: %m\n");
-
+	len = mnl_nlmsg_batch_size(batch);
 	mnl_nlmsg_batch_stop(batch);
 
-	if ((ret = mnl_socket_recvfrom(mnl, buf, sizeof buf)) < 0)
-		FBR_FATAL("mnl_socket_recvfrom: %m\n");
+	return len;
+}
 
-	do {
-		if ((ret = mnl_cb_run(buf, ret, 0, 0, 0, 0)) < 0)
+static void fbr_add_addr(const struct fbr_addr *const addr)
+{
+	uint8_t buf[MNL_SOCKET_BUFFER_SIZE * 2];
+	char addrbuf[INET6_ADDRSTRLEN];
+	const struct fbr_set_opts *set_opts;
+	size_t len;
+	ssize_t got;
+	unsigned int i;
+	uint32_t seq;
+
+	if (addr->family == AF_INET) {
+		set_opts = &fbr_set_opts4;
+		fbr_inet_ntop(AF_INET, &addr->in, addrbuf);
+	}
+	else {
+		set_opts = &fbr_set_opts6;
+		fbr_inet_ntop(AF_INET6, &addr->in6, addrbuf);
+	}
+
+	seq = fbr_mnl_sequence + 1;
+
+	len = fbr_build_batch(buf, addr, set_opts);
+
+	if ((mnl_socket_sendto(fbr_mnl_socket, buf, len)) < 0)
+		FBR_FATAL("mnl_socket_sendto: %m\n");
+
+	for (i = 0; i < 3; ++i, ++seq) {
+
+		got = mnl_socket_recvfrom(fbr_mnl_socket, buf, sizeof buf);
+		if (got < 0)
+			FBR_FATAL("mnl_socket_recvfrom: %m\n");
+
+		if (mnl_cb_run(buf, got, seq, fbr_mnl_portid, NULL, NULL) < 0)
 			FBR_FATAL("mnl_cb_run: %m\n");
 	}
-	while (ret > 0);
 
 	FBR_INFO("added %s to %s:%s:%s\n", addrbuf,
-		 fbr_fmt_proto(proto), table, set);
-
+		 fbr_fmt_proto(set_opts->proto),
+		 set_opts->table, set_opts->set);
 }
 
 static volatile sig_atomic_t fbr_got_signal = 0;
@@ -655,7 +724,6 @@ static void fbr_sighndlr_init(const int fd)
 int main(int argc __attribute__((unused)), const char *const *const argv)
 {
 	union fbr_sockaddr client;
-	struct mnl_socket *mnl;
 	struct fbr_addr inbuf;
 	socklen_t clientsz;
 	ssize_t insize;
@@ -663,7 +731,7 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 	
 	fbr_parse_opts(argv);
 	listenfd = fbr_listen_init(&fbr_listen);
-	mnl = fbr_mnl_init();
+	fbr_mnl_init();
 	fbr_sighndlr_init(listenfd);
 	
 	while (!fbr_got_signal) {
@@ -681,7 +749,7 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 			char buf[INET6_ADDRSTRLEN];
 			FBR_DEBUG("Received %zd bytes from %s/%" PRIu16 "\n",
 				  insize, fbr_format_sa(&client, buf),
-				  ntohs(client.sin.sin_port));
+				  be16toh(client.sin.sin_port));
 		}
 		
 		if ((size_t)insize < sizeof inbuf) {
@@ -690,7 +758,7 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 			continue;
 		}
 		
-		inbuf.family = ntohs(inbuf.family);
+		inbuf.family = be16toh(inbuf.family);
 		
 		if (inbuf.family != AF_INET && inbuf.family != AF_INET6) {
 			FBR_WARN("received unknown address family: %d\n",
@@ -698,9 +766,9 @@ int main(int argc __attribute__((unused)), const char *const *const argv)
 			continue;
 		}
 		
-		fbr_add_addr(mnl, &inbuf);
+		fbr_add_addr(&inbuf);
 	}
 	
-	fbr_mnl_fini(mnl);
+	fbr_mnl_fini();
 	return EXIT_SUCCESS;
 }
