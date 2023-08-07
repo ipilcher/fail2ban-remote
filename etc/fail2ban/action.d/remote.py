@@ -1,5 +1,5 @@
 #
-# Copyright 2019 Ian Pilcher <arequipeno@gmail.com>
+# Copyright 2019, 2023 Ian Pilcher <arequipeno@gmail.com>
 #
 # This program is free software.  You can redistribute it or modify it under
 # the terms of version 2 of the GNU General Public License (GPL), as published
@@ -35,7 +35,7 @@ class RemoteAction(ActionBase):
 		self.socket.close()
 
 	def ban(self, aInfo):
-		ip = ipaddress.ip_address(unicode(aInfo['ip']))
+		ip = ipaddress.ip_address(aInfo['ip'])
 		msg = bytearray(20)
 		if ip.version == 4:
 			msg[1] = AF_INET
