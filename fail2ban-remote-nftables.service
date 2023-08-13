@@ -1,0 +1,14 @@
+[Unit]
+Description=Create nftables sets for Fail2Ban remote
+Wants=network-online.target
+After=network-online.target
+Before=fail2ban-remote.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table netdev fail2ban
+ExecStart=/usr/sbin/nft -f /etc/nftables/fail2ban.nft
+
+[Install]
+WantedBy=multi-user.target

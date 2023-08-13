@@ -7,7 +7,7 @@ After=network-online.target
 Type=simple
 DynamicUser=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-ExecStart=/usr/local/bin/fbr-remote -v -a 172.31.255.254 -p inet -t filter -s FAIL2BAN4 -P inet -T filter -S FAIL2BAN6
+ExecStart=/usr/local/bin/fail2ban-remote -v -a 172.31.255.254 -p netdev -t fail2ban -s BANNED-IPV4 -P netdev -T fail2ban -S BANNED-IPV6
 
 [Install]
 WantedBy=multi-user.target
